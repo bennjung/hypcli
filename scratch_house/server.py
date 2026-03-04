@@ -20,7 +20,7 @@ from scratch_house.models import BoardState, MusicState, QueueItem, UserSession,
 LOG = logging.getLogger("scratch_house.server")
 
 
-@dataclass(slots=True)
+@dataclass
 class PendingLinkSession:
     session_id: str
     websocket: WebSocketServerProtocol
@@ -37,7 +37,7 @@ class PendingLinkSession:
         }
 
 
-@dataclass(slots=True)
+@dataclass
 class LoungeState:
     users: dict[WebSocketServerProtocol, UserSession] = field(default_factory=dict)
     accumulated_active_seconds: dict[str, int] = field(default_factory=lambda: defaultdict(int))

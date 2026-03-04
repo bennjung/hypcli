@@ -20,8 +20,9 @@
 
 ## 설치
 ```bash
-python -m venv .venv
+python3.8 -m venv .venv
 source .venv/bin/activate
+python -m pip install -U pip setuptools wheel
 pip install -e .
 ```
 

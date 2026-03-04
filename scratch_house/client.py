@@ -23,6 +23,14 @@ from websockets.exceptions import ConnectionClosed
 LOG = logging.getLogger("scratch_house.client")
 
 
+async def run_in_thread(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    if hasattr(asyncio, "to_thread"):
+        return await asyncio.to_thread(func, *args, **kwargs)  # type: ignore[attr-defined]
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+
+
 class LocalView:
     def __init__(self) -> None:
         self.users: list[dict[str, Any]] = []
@@ -111,7 +119,7 @@ class YtDlpResolver:
         if cached and cached[1] > time.time():
             return cached[0]
 
-        resolved = await asyncio.to_thread(self._resolve_blocking, source)
+        resolved = await run_in_thread(self._resolve_blocking, source)
         if not resolved:
             return source
 
@@ -404,7 +412,7 @@ class ScratchHouseClient:
             await asyncio.sleep(8)
             if not self._linked:
                 continue
-            token_usage = await asyncio.to_thread(self.usage_tracker.get_token_usage)
+            token_usage = await run_in_thread(self.usage_tracker.get_token_usage)
             if token_usage is None:
                 continue
             if token_usage == self._last_reported_token_usage:
@@ -424,7 +432,7 @@ class ScratchHouseClient:
 
     async def _input_loop(self, websocket: Any) -> None:
         while self._running:
-            line = await asyncio.to_thread(input)
+            line = await run_in_thread(input)
             line = line.strip()
             if not line:
                 continue

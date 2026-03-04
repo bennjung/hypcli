@@ -13,7 +13,7 @@ def isoformat(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
 
-@dataclass(slots=True)
+@dataclass
 class MusicState:
     url: str = ""
     playing: bool = False
@@ -34,7 +34,7 @@ class MusicState:
         }
 
 
-@dataclass(slots=True)
+@dataclass
 class QueueItem:
     queue_id: int
     url: str
@@ -50,7 +50,7 @@ class QueueItem:
         }
 
 
-@dataclass(slots=True)
+@dataclass
 class BoardState:
     content: str = "Welcome to Scratch House"
     updated_at: datetime = field(default_factory=utc_now)
@@ -64,7 +64,7 @@ class BoardState:
         }
 
 
-@dataclass(slots=True)
+@dataclass
 class UserSession:
     name: str
     joined_at: datetime = field(default_factory=utc_now)
