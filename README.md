@@ -32,6 +32,17 @@ pip install -e .
 scratch-house-server --host 0.0.0.0 --port 8765 --api-host 127.0.0.1 --api-port 8787 --link-api-token <SECRET_TOKEN> --reports-dir reports
 ```
 
+또는 실행 스크립트:
+```bash
+chmod +x ./run_server.sh
+LINK_API_TOKEN=<SECRET_TOKEN> ./run_server.sh
+```
+
+문제 진단 모드:
+```bash
+DEBUG=1 ./run_server.sh
+```
+
 2) Telegram bot
 ```bash
 scratch-house-telegram-bot --bot-token <TELEGRAM_BOT_TOKEN> --link-api-base http://127.0.0.1:8787 --link-api-token <SECRET_TOKEN>
