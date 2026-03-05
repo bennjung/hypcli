@@ -43,6 +43,11 @@ LINK_API_TOKEN=<SECRET_TOKEN> ./run_server.sh
 DEBUG=1 ./run_server.sh
 ```
 
+포트/바인드 주소 변경:
+```bash
+WS_HOST=0.0.0.0 WS_PORT=8765 API_BIND_HOST=127.0.0.1 API_BIND_PORT=8787 ./run_server.sh
+```
+
 2) Telegram bot
 ```bash
 scratch-house-telegram-bot --bot-token <TELEGRAM_BOT_TOKEN> --link-api-base http://127.0.0.1:8787 --link-api-token <SECRET_TOKEN>
