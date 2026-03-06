@@ -9,6 +9,11 @@ dependencies = [
   "websockets>=10.4,<12.0"
 ]
 
+[project.optional-dependencies]
+webrtc = [
+  "aiortc>=1.10,<2.0; python_version >= '3.10'"
+]
+
 [project.scripts]
 scratch-house-server = "scratch_house.server:main"
 scratch-house-client = "scratch_house.client:main"

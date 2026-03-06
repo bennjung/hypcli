@@ -30,6 +30,7 @@ LINK_API_TOKEN="${LINK_API_TOKEN:-}"
 LINK_TTL_SECONDS="${LINK_TTL_SECONDS:-120}"
 REPORTS_DIR="${REPORTS_DIR:-${ROOT_DIR}/reports}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
+PUBLIC_API_BASE="${PUBLIC_API_BASE:-${SCRATCH_PUBLIC_API_BASE:-}}"
 
 mkdir -p "${REPORTS_DIR}"
 
@@ -48,6 +49,7 @@ args=(
   --link-api-token "${LINK_API_TOKEN}"
   --link-ttl-seconds "${LINK_TTL_SECONDS}"
   --reports-dir "${REPORTS_DIR}"
+  --public-api-base "${PUBLIC_API_BASE}"
   --log-level "${LOG_LEVEL}"
 )
 

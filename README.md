@@ -4,6 +4,7 @@
 
 ## 구현된 범위
 - WebSocket Signaling/State 서버
+- `aiortc` 기반 WebRTC 음악 브로드캐스트 PoC (`/debug/music-poc`)
 - 라운지 유저 상태 동기화 (입장/퇴장, mute/speaking)
 - 음악 상태 동기화 (`/play`, `/pause`, `/resume`, `/seek`)
 - 음악 큐 동기화 (`/play` enqueue, host의 `/next`로만 다음 곡)
@@ -26,10 +27,17 @@ python -m pip install -U pip setuptools wheel
 pip install -e .
 ```
 
+WebRTC 음악 PoC까지 설치하려면:
+```bash
+pip install -e ".[webrtc]"
+```
+
+`aiortc` extra는 Python 3.10 이상에서만 설치를 권장합니다.
+
 ## 실행
 1) 서버
 ```bash
-scratch-house-server --host 0.0.0.0 --port 8765 --api-host 127.0.0.1 --api-port 8787 --link-api-token <SECRET_TOKEN> --reports-dir reports
+scratch-house-server --host 0.0.0.0 --port 8765 --api-host 127.0.0.1 --api-port 8787 --public-api-base http://127.0.0.1:8787 --link-api-token <SECRET_TOKEN> --reports-dir reports
 ```
 
 또는 실행 스크립트:
@@ -48,6 +56,14 @@ DEBUG=1 ./run_server.sh
 WS_HOST=0.0.0.0 WS_PORT=8765 API_BIND_HOST=127.0.0.1 API_BIND_PORT=8787 ./run_server.sh
 ```
 
+WebRTC 음악 PoC 확인:
+```text
+http://127.0.0.1:8787/debug/music-poc
+```
+
+PoC 페이지에서 `Start Receiver`를 누르면 서버가 WebRTC 오디오 트랙을 발행합니다.
+현재 곡 상태가 `playing=true`이면 FFmpeg가 생성한 톤이 들리고, pause/idle이면 FFmpeg 무음 소스로 전환됩니다.
+
 2) Telegram bot
 ```bash
 scratch-house-telegram-bot --bot-token <TELEGRAM_BOT_TOKEN> --link-api-base http://127.0.0.1:8787 --link-api-token <SECRET_TOKEN>
@@ -60,12 +76,12 @@ scratch-house-client --server ws://127.0.0.1:8765 --link-telegram --device-name 
 
 4) 클라이언트 B (수동 이름 모드)
 ```bash
-scratch-house-client --name bob --server ws://127.0.0.1:8765 --claude-project-path /Users/you/sideproj/hyperfocus_cli
+scratch-house-client --name bob --server ws://127.0.0.1:8765 --webrtc-api-base http://127.0.0.1:8787 --claude-project-path /Users/you/sideproj/hyperfocus_cli
 ```
 
 `mpv`를 실제로 붙이고 싶으면:
 ```bash
-scratch-house-client --name alice --server ws://127.0.0.1:8765 --mpv
+scratch-house-client --name alice --server ws://127.0.0.1:8765 --disable-webrtc-recv --mpv
 ```
 
 `yt-dlp` 추출을 끄고 원본 URL을 직접 재생하려면:
@@ -74,21 +90,9 @@ scratch-house-client --name alice --server ws://127.0.0.1:8765 --mpv --disable-y
 ```
 
 ## 클라이언트 명령어
-- `/help`
-- `/play <url>`
-- `/skip`
-- `/pause`
-- `/resume`
-- `/seek <seconds>`
-- `/next` (host only)
-- `/close` (host only, 모든 세션 종료 + 결산 리포트 저장)
-- `/board <text>`
-- `/mute on|off`
-- `/speak on|off`
-- `/users`
-- `/ranking`
-- `/queue`
-- `/quit`
+- 공통: `/help`, `/play <url>`, `/mute on|off`, `/users`, `/ranking`, `/queue`, `/quit`
+- Host only: `/pause`, `/resume`, `/seek <seconds>`, `/next`, `/close`, `/board <text>`, `/speak on|off`
+- 일반 유저의 `/play <url>` 는 즉시 재생이 아니라 대기 큐에만 추가됩니다.
 
 ## TUI 단축키
 - `Q`: 종료 (`/quit`)
@@ -100,7 +104,7 @@ scratch-house-client --name alice --server ws://127.0.0.1:8765 --mpv --disable-y
 
 `members`와 `leaderboard`는 서버의 `user_state`/`ranking_state` 이벤트 수신 시 자동 리프레시됩니다.
 `Token Usage`는 각 클라이언트가 로컬 Claude Code 로그를 읽어 서버에 주기 보고한 값을 사용합니다.
-`yt-dlp`가 설치되어 있으면 URL에서 오디오 직링크를 추출해 `mpv`로 재생합니다. 미설치 시 원본 URL 재생으로 fallback 됩니다.
+클라이언트의 `mpv` 직접재생 경로는 아직 남아 있는 레거시 fallback이며, 새 음악 경로 검증은 서버 WebRTC PoC 기준으로 진행합니다.
 
 ## Telegram 링크 플로우
 1. 사용자가 `scratch-house-client --link-telegram` 실행
@@ -116,9 +120,13 @@ scratch-house-client --name alice --server ws://127.0.0.1:8765 --mpv --disable-y
 - `scratch_house/models.py`: 공용 상태 모델
 
 ## 메모
-- 실제 WebRTC 음성(SFU/Opus 튜닝)은 다음 단계 구현 대상으로 남겨두었습니다.
+- 현재 WebRTC PoC는 `aiortc` + `FFmpeg stdout PCM` 기반 서버 발행 오디오 트랙만 검증합니다.
+- 현재 서버는 `yt-dlp`로 유튜브 오디오 스트림 URL을 해석한 뒤, `FFmpeg`가 이를 PCM으로 디코딩해 WebRTC 트랙으로 송출합니다.
+- WebRTC 수신 클라이언트는 `aiortc + ffplay` 기반이며, `--webrtc-api-base` 또는 서버의 `--public-api-base`가 필요합니다.
+- 실제 WebRTC 음성(SFU/Opus 튜닝)과 브라우저 외 수신 클라이언트는 다음 단계 구현 대상입니다.
 - 현재는 문서의 상태 동기화/라운지 동작을 우선 검증하는 프로토타입입니다.
 - `mpv` IPC는 Unix 계열(macOS/Linux)에서 활성화되며, Windows에서는 제한적으로 동작합니다.
 - host는 첫 `/play`를 보낸 사용자로 설정되며, host 이탈 시 접속 중 가장 오래된 사용자로 자동 승계됩니다.
+- non-host 유저는 서버 기준으로 `/play` 큐 추가와 `/mute`만 허용됩니다.
 - host가 `/close`를 실행하면 모든 세션을 하드킬하고 `--reports-dir`에 결산 JSON 파일을 저장합니다.
 - Link API는 `--link-api-token` 설정 시 Bearer 인증이 필요합니다.

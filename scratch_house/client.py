@@ -11,14 +11,25 @@ import shutil
 import shlex
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from collections import deque
 from datetime import datetime
+from urllib.parse import urlparse
 from typing import Any, Callable
+
+try:
+    import termios
+    import tty
+except ImportError:  # pragma: no cover - windows fallback
+    termios = None  # type: ignore[assignment]
+    tty = None  # type: ignore[assignment]
 
 from websockets.client import connect
 from websockets.exceptions import ConnectionClosed
+
+from scratch_house.webrtc_client import WebrtcMusicReceiver
 
 LOG = logging.getLogger("scratch_house.client")
 
@@ -31,6 +42,179 @@ async def run_in_thread(func: Callable[..., Any], *args: Any, **kwargs: Any) -> 
     return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
 
+class DynamicTerminalUI:
+    def __init__(
+        self,
+        render_frame: Callable[[str], str],
+        on_submit: Callable[[str], Any],
+    ) -> None:
+        self.render_frame = render_frame
+        self.on_submit = on_submit
+        self.active = False
+        self.input_buffer = ""
+        self._previous_lines: list[str] = []
+        self._dirty = asyncio.Event()
+        self._fd: int | None = None
+        self._old_termios: Any = None
+        self._input_task: asyncio.Task[None] | None = None
+        self._tick_task: asyncio.Task[None] | None = None
+        self._render_task: asyncio.Task[None] | None = None
+        self._byte_queue: asyncio.Queue[bytes] = asyncio.Queue()
+
+    async def start(self) -> bool:
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            return False
+        if os.name == "nt" or termios is None or tty is None:
+            return False
+
+        self._fd = sys.stdin.fileno()
+        self._old_termios = termios.tcgetattr(self._fd)
+        tty.setcbreak(self._fd)
+        loop = asyncio.get_running_loop()
+        loop.add_reader(self._fd, self._on_stdin_ready)
+        sys.stdout.write("\033[?1049h\033[?25l\033[2J")
+        sys.stdout.flush()
+        self.active = True
+        self._input_task = asyncio.create_task(self._input_loop())
+        self._tick_task = asyncio.create_task(self._tick_loop())
+        self._render_task = asyncio.create_task(self._render_loop())
+        self.request_render()
+        return True
+
+    async def stop(self) -> None:
+        self.active = False
+        if self._tick_task:
+            self._tick_task.cancel()
+            try:
+                await self._tick_task
+            except asyncio.CancelledError:
+                pass
+            self._tick_task = None
+        if self._render_task:
+            self._render_task.cancel()
+            try:
+                await self._render_task
+            except asyncio.CancelledError:
+                pass
+            self._render_task = None
+        if self._input_task:
+            self._input_task.cancel()
+            try:
+                await self._input_task
+            except asyncio.CancelledError:
+                pass
+            self._input_task = None
+        if self._fd is not None:
+            try:
+                asyncio.get_running_loop().remove_reader(self._fd)
+            except Exception:
+                pass
+            if self._old_termios is not None:
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_termios)
+        self._fd = None
+        self._old_termios = None
+        self._previous_lines = []
+        sys.stdout.write("\033[?25h\033[?1049l")
+        sys.stdout.flush()
+
+    def request_render(self) -> None:
+        self._dirty.set()
+
+    def _on_stdin_ready(self) -> None:
+        if self._fd is None:
+            return
+        try:
+            data = os.read(self._fd, 1024)
+        except OSError:
+            return
+        if data:
+            self._byte_queue.put_nowait(data)
+
+    async def _tick_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(0.5)
+                self.request_render()
+        except asyncio.CancelledError:
+            raise
+
+    async def _render_loop(self) -> None:
+        try:
+            while True:
+                await self._dirty.wait()
+                await self.draw()
+        except asyncio.CancelledError:
+            raise
+
+    async def _input_loop(self) -> None:
+        try:
+            while True:
+                data = await self._byte_queue.get()
+                await self._handle_bytes(data)
+        except asyncio.CancelledError:
+            raise
+
+    async def _handle_bytes(self, data: bytes) -> None:
+        idx = 0
+        while idx < len(data):
+            byte = data[idx]
+            idx += 1
+            if byte == 3:
+                await self._submit_line("/quit")
+                continue
+            if byte in {13, 10}:
+                line = self.input_buffer.strip()
+                self.input_buffer = ""
+                self.request_render()
+                if line:
+                    await self._submit_line(line)
+                continue
+            if byte in {8, 127}:
+                self.input_buffer = self.input_buffer[:-1]
+                self.request_render()
+                continue
+            if byte == 27:
+                if idx < len(data) and data[idx:idx + 1] == b"[":
+                    idx += 1
+                    while idx < len(data) and not (64 <= data[idx] <= 126):
+                        idx += 1
+                    if idx < len(data):
+                        idx += 1
+                continue
+            if 32 <= byte <= 126:
+                char = chr(byte)
+                if not self.input_buffer and char.lower() in {"q", "w", "r", "m", "n", "x"}:
+                    await self._submit_line(char)
+                    continue
+                self.input_buffer += char
+                self.request_render()
+
+    async def _submit_line(self, line: str) -> None:
+        result = self.on_submit(line)
+        if asyncio.iscoroutine(result):
+            await result
+
+    async def draw(self) -> None:
+        frame = self.render_frame(self.input_buffer)
+        lines = frame.splitlines()
+        width = shutil.get_terminal_size((100, 40)).columns
+        max_lines = max(len(lines), len(self._previous_lines))
+        output: list[str] = []
+        for row in range(max_lines):
+            new_line = lines[row] if row < len(lines) else ""
+            old_line = self._previous_lines[row] if row < len(self._previous_lines) else None
+            if old_line == new_line:
+                continue
+            clipped = new_line[:width]
+            padded = clipped.ljust(width)
+            output.append(f"\033[{row + 1};1H{padded}")
+        output.append(f"\033[{len(lines) + 1};1H")
+        sys.stdout.write("".join(output))
+        sys.stdout.flush()
+        self._previous_lines = lines
+        self._dirty.clear()
+
+
 class LocalView:
     def __init__(self) -> None:
         self.users: list[dict[str, Any]] = []
@@ -39,6 +223,8 @@ class LocalView:
         self.music: dict[str, Any] = {}
         self.queue: list[dict[str, Any]] = []
         self.host: str | None = None
+        self.webrtc: dict[str, Any] = {}
+        self.webrtc_api_base: str = ""
 
 
 class ClaudeUsageTracker:
@@ -347,6 +533,8 @@ class ScratchHouseClient:
         name: str,
         mpv_enabled: bool,
         enable_yt_dlp: bool,
+        webrtc_recv_enabled: bool,
+        webrtc_api_base: str,
         link_via_telegram: bool,
         device_name: str,
         claude_project_path: str,
@@ -356,6 +544,7 @@ class ScratchHouseClient:
         self.link_via_telegram = link_via_telegram
         self.device_name = device_name
         self.usage_tracker = ClaudeUsageTracker(project_path=claude_project_path)
+        self.webrtc_api_base = webrtc_api_base.rstrip("/")
 
         self.view = LocalView()
         self.player = MpvPlayer(
@@ -363,16 +552,28 @@ class ScratchHouseClient:
             on_notice=self._push_event,
             enable_yt_dlp=enable_yt_dlp,
         )
+        self.webrtc_receiver = WebrtcMusicReceiver(
+            enabled=webrtc_recv_enabled,
+            on_notice=self._push_event,
+        )
         self._running = True
         self._linked = not link_via_telegram
         self._events: deque[str] = deque(maxlen=8)
         self._display_lock = asyncio.Lock()
         self._send_lock = asyncio.Lock()
         self._last_reported_token_usage: int | None = None
+        self._ui: DynamicTerminalUI | None = None
+        self._websocket: Any | None = None
 
     async def run(self) -> None:
         try:
             async with connect(self.server_url) as websocket:
+                self._websocket = websocket
+                self._ui = DynamicTerminalUI(
+                    render_frame=self._build_tui,
+                    on_submit=lambda line: self._handle_user_input(websocket, line),
+                )
+                ui_started = await self._ui.start()
                 await self._send_json(
                     websocket,
                     {
@@ -383,16 +584,19 @@ class ScratchHouseClient:
                     },
                 )
                 self._push_event(f"Connected to {self.server_url}")
-                self._push_event("Type command and press Enter. Use /help.")
+                if ui_started:
+                    self._push_event("Dynamic TUI ready. Type command or use shortcuts. /help")
+                else:
+                    self._push_event("Type command and press Enter. Use /help.")
                 await self.render_screen()
 
                 receiver = asyncio.create_task(self._receive_loop(websocket))
-                sender = asyncio.create_task(self._input_loop(websocket))
+                sender = asyncio.create_task(self._input_loop(websocket)) if not ui_started else None
                 usage_reporter = asyncio.create_task(self._token_usage_loop(websocket))
-                done, pending = await asyncio.wait(
-                    [receiver, sender, usage_reporter],
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
+                wait_tasks = [receiver, usage_reporter]
+                if sender:
+                    wait_tasks.append(sender)
+                done, pending = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
                 for task in pending:
                     task.cancel()
                 for task in done:
@@ -400,7 +604,12 @@ class ScratchHouseClient:
                     if exc:
                         raise exc
         finally:
+            if self._ui:
+                await self._ui.stop()
+                self._ui = None
+            await self.webrtc_receiver.stop()
             self.player.close()
+            self._websocket = None
 
     async def _receive_loop(self, websocket: Any) -> None:
         async for raw in websocket:
@@ -478,7 +687,10 @@ class ScratchHouseClient:
         cmd = command.lower()
 
         if cmd == "/help":
-            self._push_event("/play /skip /next /close /pause /resume /seek /queue /users /ranking /quit")
+            if self.view.host == self.name:
+                self._push_event("/play /pause /resume /seek /next /close /board /mute /queue /users /ranking /quit")
+            else:
+                self._push_event("Non-host: /play queues only, /mute, /queue, /users, /ranking, /quit")
             await self.render_screen()
             return
 
@@ -611,8 +823,11 @@ class ScratchHouseClient:
             self.view.music = payload.get("music", {})
             self.view.queue = payload.get("queue", [])
             self.view.host = payload.get("host")
+            self.view.webrtc = payload.get("webrtc", {})
+            self.view.webrtc_api_base = str(payload.get("webrtc_api_base", "")).strip()
             self._linked = True
             self._push_event("State synced")
+            await self._sync_webrtc_receiver()
             await self._sync_mpv()
             await self.render_screen()
             return
@@ -666,6 +881,10 @@ class ScratchHouseClient:
             await self.render_screen()
 
     async def _sync_mpv(self) -> None:
+        if await self._sync_webrtc_receiver():
+            self.player.close()
+            return
+
         music = self.view.music
         url = str(music.get("url", "")).strip()
         if not url:
@@ -693,12 +912,22 @@ class ScratchHouseClient:
 
         self.player.update_reference(position, playing)
 
+    async def _sync_webrtc_receiver(self) -> bool:
+        api_base = self._effective_webrtc_api_base()
+        if not api_base:
+            return False
+        return await self.webrtc_receiver.ensure_started(api_base)
+
     async def render_screen(self) -> None:
-        ui = self._build_tui()
+        if self._ui and self._ui.active:
+            async with self._display_lock:
+                await self._ui.draw()
+            return
+        ui = self._build_tui("")
         async with self._display_lock:
             print("\033[2J\033[H" + ui, end="", flush=True)
 
-    def _build_tui(self) -> str:
+    def _build_tui(self, command_buffer: str = "") -> str:
         host_name = (self.view.host or "-")[:16]
         start_time = self._room_start_time()
         member_count = len(self.view.users)
@@ -709,6 +938,9 @@ class ScratchHouseClient:
         song_short = song_url if len(song_url) <= 70 else song_url[:67] + "..."
         play_pos = self._format_mmss(float(self.view.music.get("position_seconds", 0.0)))
         play_state = "LIVE" if bool(self.view.music.get("playing", False)) else "PAUSE"
+        webrtc_mode = str(self.view.webrtc.get("mode", "-"))
+        webrtc_state = "ON" if bool(self.view.webrtc.get("enabled", False)) else "OFF"
+        webrtc_peers = int(self.view.webrtc.get("peer_connections", 0) or 0)
 
         lines: list[str] = []
         lines.append("================ Focus Room ================")
@@ -721,6 +953,7 @@ class ScratchHouseClient:
         lines.append("-- Playing ---------------------------------")
         lines.append(f"| Song    : {song_short:<70}|")
         lines.append(f"| Playing : {play_pos:<8} ({play_state}){'':<53}|")
+        lines.append(f"| WebRTC  : {webrtc_state:<3} {webrtc_mode:<12} peers={webrtc_peers:<3}{'':<39}|")
         lines.append("--------------------------------------------")
         lines.append("")
 
@@ -763,7 +996,11 @@ class ScratchHouseClient:
 
         lines.append("")
         lines.append("[Q] Quit  [W] Work  [R] Rest  [M] Mute  [N] Next  [X] Close Session")
-        lines.append("Type command and press Enter (ex: /play <url>, /skip, /queue, /close)")
+        if self.view.host == self.name:
+            lines.append("Host controls: /play <url> /pause /resume /next /close /queue")
+        else:
+            lines.append("Member controls: /play <url> queues only, /mute on|off, /queue")
+        lines.append(f"Command> {command_buffer}")
         lines.append("")
 
         return "\n".join(lines)
@@ -815,6 +1052,8 @@ class ScratchHouseClient:
         if not message:
             return
         self._events.appendleft(message)
+        if self._ui and self._ui.active:
+            self._ui.request_render()
 
     def _find_user(self, name: str) -> dict[str, Any] | None:
         for user in self.view.users:
@@ -860,6 +1099,22 @@ class ScratchHouseClient:
             return str(tokens)
         return f"{tokens / 1000:.1f}k"
 
+    def _effective_webrtc_api_base(self) -> str:
+        if self.webrtc_api_base:
+            return self.webrtc_api_base
+        if self.view.webrtc_api_base:
+            return str(self.view.webrtc_api_base).rstrip("/")
+
+        parsed = urlparse(self.server_url)
+        if parsed.scheme not in {"ws", "wss"} or not parsed.hostname:
+            return ""
+        scheme = "https" if parsed.scheme == "wss" else "http"
+        port = parsed.port
+        if port is None:
+            return ""
+        guessed_port = port + 22
+        return f"{scheme}://{parsed.hostname}:{guessed_port}"
+
     @staticmethod
     def _parse(raw: Any) -> dict[str, Any]:
         if isinstance(raw, bytes):
@@ -898,6 +1153,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable yt-dlp stream extraction and play original URLs directly",
     )
+    parser.add_argument(
+        "--disable-webrtc-recv",
+        action="store_true",
+        help="Disable aiortc-based WebRTC music receiving and use legacy local playback",
+    )
+    parser.add_argument(
+        "--webrtc-api-base",
+        default="",
+        help="HTTP base URL for WebRTC offer endpoint (ex: http://127.0.0.1:8787)",
+    )
     parser.add_argument("--log-level", default="WARNING", help="Logging level")
     args = parser.parse_args()
 
@@ -918,6 +1183,8 @@ def main() -> None:
         name=args.name or "link-pending",
         mpv_enabled=args.mpv,
         enable_yt_dlp=not bool(args.disable_yt_dlp),
+        webrtc_recv_enabled=not bool(args.disable_webrtc_recv),
+        webrtc_api_base=str(args.webrtc_api_base),
         link_via_telegram=bool(args.link_telegram),
         device_name=str(args.device_name),
         claude_project_path=str(args.claude_project_path),

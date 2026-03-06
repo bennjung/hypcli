@@ -16,6 +16,7 @@ from websockets.exceptions import ConnectionClosed
 from websockets.server import WebSocketServerProtocol, serve
 
 from scratch_house.models import BoardState, MusicState, QueueItem, UserSession, utc_now
+from scratch_house.webrtc_music import AiortcMusicPoc
 
 LOG = logging.getLogger("scratch_house.server")
 
@@ -110,6 +111,7 @@ class ScratchHouseServer:
         link_api_token: str = "",
         link_ttl_seconds: int = 120,
         reports_dir: str = "reports",
+        public_api_base: str = "",
     ) -> None:
         self.state = LoungeState()
         self.pending_link_sessions: dict[str, PendingLinkSession] = {}
@@ -118,8 +120,10 @@ class ScratchHouseServer:
         self.link_api_token = link_api_token.strip()
         self.link_ttl_seconds = max(30, int(link_ttl_seconds))
         self.reports_dir = reports_dir
+        self.public_api_base = public_api_base.rstrip("/")
         self._tick_task: asyncio.Task[None] | None = None
         self._http_runner: web.AppRunner | None = None
+        self.webrtc_music = AiortcMusicPoc()
 
     async def start(self, host: str, port: int, api_host: str, api_port: int) -> None:
         self._tick_task = asyncio.create_task(self._periodic_ranking_broadcast())
@@ -138,6 +142,9 @@ class ScratchHouseServer:
         app = web.Application()
         app.router.add_get("/api/link/sessions", self.http_list_link_sessions)
         app.router.add_post("/api/link/assign", self.http_assign_link_session)
+        app.router.add_get("/api/webrtc/status", self.webrtc_music.status_endpoint)
+        app.router.add_post("/api/webrtc/music-offer", self.webrtc_music.offer)
+        app.router.add_get("/debug/music-poc", self.webrtc_music.debug_page)
 
         self._http_runner = web.AppRunner(app)
         await self._http_runner.setup()
@@ -146,6 +153,7 @@ class ScratchHouseServer:
         LOG.info("Link API listening on http://%s:%d", host, port)
 
     async def _stop_link_api(self) -> None:
+        await self.webrtc_music.shutdown()
         if self._http_runner:
             await self._http_runner.cleanup()
             self._http_runner = None
@@ -233,6 +241,19 @@ class ScratchHouseServer:
             await self.broadcast({"type": "user_state", "users": self.state.user_snapshots()})
             return
 
+        if msg_type not in {"set_mute", "token_usage_report", "play"}:
+            self.state.ensure_host_connection()
+            if websocket != self.state.host_connection:
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "error": "only host can use this command. non-host users may only /play to queue and /mute",
+                        }
+                    )
+                )
+                return
+
         if msg_type == "set_speaking":
             user.speaking = bool(payload.get("speaking", False))
             await self.broadcast({"type": "user_state", "users": self.state.user_snapshots()})
@@ -256,11 +277,21 @@ class ScratchHouseServer:
             if not self.state.host_connection:
                 self.state.host_connection = websocket
                 await self.broadcast_host_state()
+            is_host = websocket == self.state.host_connection
             self.state.enqueue_track(url=url, requested_by=user.name)
-            if not self.state.music.url:
+            if is_host and not self.state.music.url:
                 await self.start_next_track()
             else:
                 await self.broadcast_queue_state()
+                if not is_host:
+                    await websocket.send(
+                        json.dumps(
+                            {
+                                "type": "system",
+                                "message": "track added to queue. host must start playback.",
+                            }
+                        )
+                    )
             return
 
         if msg_type == "next":
@@ -289,13 +320,16 @@ class ScratchHouseServer:
                 self.state.music.position_seconds = float(current_position)
                 self.state.music.playing = False
                 self.state.music.started_at = None
+                await self.webrtc_music.pause(self.state.music.position_seconds)
             await self.broadcast({"type": "music_state", "music": self.state.music.snapshot()})
             return
 
         if msg_type == "resume":
             if self.state.music.url:
+                current_position = float(self.state.music.position_seconds)
                 self.state.music.playing = True
                 self.state.music.started_at = utc_now()
+                await self.webrtc_music.resume(current_position)
             await self.broadcast({"type": "music_state", "music": self.state.music.snapshot()})
             return
 
@@ -303,6 +337,10 @@ class ScratchHouseServer:
             position = float(payload.get("position_seconds", 0.0))
             self.state.music.position_seconds = max(0.0, position)
             self.state.music.started_at = utc_now() if self.state.music.playing else None
+            await self.webrtc_music.seek(
+                position_seconds=self.state.music.position_seconds,
+                playing=self.state.music.playing,
+            )
             await self.broadcast({"type": "music_state", "music": self.state.music.snapshot()})
             return
 
@@ -335,6 +373,8 @@ class ScratchHouseServer:
                     "ranking": self.state.leaderboard(),
                     "queue": self.state.queue_snapshots(),
                     "host": self.state.host_name(),
+                    "webrtc": self.webrtc_music.status(),
+                    "webrtc_api_base": self.public_api_base,
                 }
             )
         )
@@ -378,22 +418,39 @@ class ScratchHouseServer:
         )
 
     async def start_next_track(self) -> None:
-        next_item = self.state.pop_next_track()
-        if not next_item:
-            self.state.music = MusicState()
+        while True:
+            next_item = self.state.pop_next_track()
+            if not next_item:
+                self.state.music = MusicState()
+                await self.webrtc_music.clear_track()
+                await self.broadcast({"type": "music_state", "music": self.state.music.snapshot()})
+                await self.broadcast_queue_state()
+                return
+
+            ok, error = await self.webrtc_music.load_track(
+                source_url=next_item.url,
+                position_seconds=0.0,
+                playing=True,
+            )
+            if not ok:
+                await self.broadcast(
+                    {
+                        "type": "system",
+                        "message": f"failed to prepare track: {next_item.url} ({error or 'unknown error'})",
+                    }
+                )
+                continue
+
+            self.state.music = MusicState(
+                url=next_item.url,
+                playing=True,
+                position_seconds=0.0,
+                started_at=utc_now(),
+                requested_by=next_item.requested_by,
+            )
             await self.broadcast({"type": "music_state", "music": self.state.music.snapshot()})
             await self.broadcast_queue_state()
             return
-
-        self.state.music = MusicState(
-            url=next_item.url,
-            playing=True,
-            position_seconds=0.0,
-            started_at=utc_now(),
-            requested_by=next_item.requested_by,
-        )
-        await self.broadcast({"type": "music_state", "music": self.state.music.snapshot()})
-        await self.broadcast_queue_state()
 
     async def broadcast_queue_state(self) -> None:
         await self.broadcast({"type": "queue_state", "queue": self.state.queue_snapshots()})
@@ -439,6 +496,7 @@ class ScratchHouseServer:
             "music": self.state.music.snapshot(),
             "queue": self.state.queue_snapshots(),
             "board": self.state.board.snapshot(),
+            "webrtc": self.webrtc_music.status(),
         }
 
         filename = f"settlement-{now.strftime('%Y%m%d-%H%M%S')}.json"
@@ -628,6 +686,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--link-api-token", default="", help="Bearer token for Link API")
     parser.add_argument("--link-ttl-seconds", type=int, default=120, help="Pending link TTL in seconds")
     parser.add_argument("--reports-dir", default="reports", help="Directory to write settlement reports")
+    parser.add_argument(
+        "--public-api-base",
+        default="",
+        help="Public HTTP base URL for WebRTC offer/status endpoints (ex: http://127.0.0.1:8787)",
+    )
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     return parser.parse_args()
 
@@ -642,6 +705,7 @@ def main() -> None:
         link_api_token=str(args.link_api_token),
         link_ttl_seconds=int(args.link_ttl_seconds),
         reports_dir=str(args.reports_dir),
+        public_api_base=str(args.public_api_base),
     )
     try:
         asyncio.run(server.start(args.host, args.port, args.api_host, args.api_port))
